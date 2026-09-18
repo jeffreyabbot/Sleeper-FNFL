@@ -803,7 +803,7 @@ with tab2:
                 return "color: #1E88E5; font-weight: 800;"
         return ""
 
-    styler_map = getattr(display_ranks.style, "map", display_ranks.style.applymap)
+    styler_map = display_ranks.style.map if hasattr(display_ranks.style, "map") else display_ranks.style.applymap
     styled_ranks = styler_map(color_number_outliers, subset=rank_cols)
 
     # 1. Define compact column widths (fits each column to the size of its header)
@@ -1118,7 +1118,7 @@ with tab4:
         return ""
 
     # Styler with formatting to 1 decimal place
-    styler_sc = getattr(df_scorecard.style, "map", df_scorecard.style.applymap)
+    styler_sc = df_scorecard.style.map if hasattr(df_scorecard.style, "map") else df_scorecard.style.applymap
     styled_scorecard = styler_sc(style_iq_outliers, subset=num_cols)
     styled_scorecard = styled_scorecard.format({col: "{:.1f}" for col in num_cols})
 
@@ -1170,7 +1170,7 @@ with tab4:
 
     blunder_display = worst_weeks[["Logo", "Week Label", "Team", "Actual Pts", "Max Potential", "Points Missed", "Efficiency %"]]
     
-    styler_blunder = getattr(blunder_display.style, "map", blunder_display.style.applymap)
+    styler_blunder = blunder_display.style.map if hasattr(blunder_display.style, "map") else blunder_display.style.applymap
     styled_blunder = styler_blunder(style_blunder_outliers, subset=["Points Missed"])
     styled_blunder = styled_blunder.format({
         "Actual Pts": "{:.1f}",
@@ -1623,7 +1623,7 @@ with tab7:
     table_cols = ["Slot", "Photo", "Player", "Pos", "Injury", "Matchup", "O/U", "Team ITT", "Weather", "Proj", "Floor", "Ceiling", "Badges"]
     df_to_render = df_display_war[table_cols].copy()
 
-    styler_war = getattr(df_to_render.style, "map", df_to_render.style.applymap)
+    styler_war = df_to_render.style.map if hasattr(df_to_render.style, "map") else df_to_render.style.applymap
     styled_war = styler_war(color_ou_outliers, subset=["O/U"])
     styled_war = styler_war(color_floor_outliers, subset=["Floor"])
     styled_war = styler_war(color_ceiling_outliers, subset=["Ceiling"])
