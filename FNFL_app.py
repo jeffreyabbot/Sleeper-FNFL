@@ -98,7 +98,8 @@ def get_league_chain(initial_league_id):
 @st.cache_data(ttl=1800)
 def get_nfl_matchup_env(season_year="2026", week_num=2):
     """
-    Pulls live Vegas lines, Over/Unders, and stadium info from ESPN's web API.
+    Pulls live Vegas lines, Over/Unders, stadium weather, and converts 
+    kickoff times to local Spanish time (Europe/Madrid / CEST).
     """
     week_num = max(1, int(week_num))
     url = f"https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=2&week={week_num}"
@@ -110,7 +111,6 @@ def get_nfl_matchup_env(season_year="2026", week_num=2):
 
     res = get_json(url)
     if not res or not res.get("events"):
-        # Fallback to general active scoreboard if week query is empty
         url_fallback = "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
         res = get_json(url_fallback)
 
@@ -129,6 +129,24 @@ def get_nfl_matchup_env(season_year="2026", week_num=2):
         venue = comp.get("venue", {})
         is_indoor = venue.get("indoor", False)
 
+        # Convert UTC game time to Spain (Europe/Madrid / CEST)
+        game_utc_str = ev.get("date")
+        kickoff_cest = "Sun 19:00"
+        is_late_night = False
+        
+        if game_utc_str:
+            try:
+                utc_dt = pd.to_datetime(game_utc_str)
+                # Convert to Spain time
+                madrid_dt = utc_dt.tz_convert("Europe/Madrid")
+                day_name = madrid_dt.strftime("%a")
+                time_str = madrid_dt.strftime("%H:%M")
+                kickoff_cest = f"{day_name} {time_str}"
+                # Games starting at or after 23:00 CEST or before 06:00 CEST are night games
+                is_late_night = (madrid_dt.hour >= 23 or madrid_dt.hour < 6)
+            except Exception:
+                pass
+
         weather = comp.get("weather", {})
         wind_speed = 0
         if isinstance(weather.get("wind"), dict):
@@ -136,12 +154,10 @@ def get_nfl_matchup_env(season_year="2026", week_num=2):
         temp = weather.get("temperature", 70)
         condition = weather.get("displayValue", "Fair")
 
-        # Parse Vegas odds from ESPN competitions
         odds_list = comp.get("odds", [])
         ou = None
         spread = 0.0
         fav_team = ""
-        details = ""
 
         if odds_list:
             ou_raw = odds_list[0].get("overUnder")
@@ -158,7 +174,6 @@ def get_nfl_matchup_env(season_year="2026", week_num=2):
 
         competitors = comp.get("competitors", [])
         if len(competitors) >= 2:
-            # competitors[0] is home, competitors[1] is away
             home_c = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
             away_c = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
             
@@ -175,6 +190,8 @@ def get_nfl_matchup_env(season_year="2026", week_num=2):
 
                 game_data = {
                     "Opponent": f"vs {opp}" if is_home else f"@{opp}",
+                    "Kickoff": kickoff_cest,
+                    "IsLateNight": is_late_night,
                     "OverUnder": ou,
                     "Spread": f"-{spread:.1f}" if is_fav else f"+{spread:.1f}",
                     "SpreadVal": spread,
@@ -224,13 +241,8 @@ def calculate_optimal_lineup(players_scores, starter_positions, player_db):
             if player["id"] in used_ids:
                 continue
             eligible = False
-            if slot == "FLEX" and any(p in player["positions"] for p in ["RB", "WR", "TE"]):
-                eligible = True
-            elif slot == "SUPER_FLEX" and any(p in player["positions"] for p in ["QB", "RB", "WR", "TE"]):
-                eligible = True
-            elif slot == "WRRB_FLEX" and any(p in player["positions"] for p in ["RB", "WR"]):
-                eligible = True
-            elif slot == "REC_FLEX" and any(p in player["positions"] for p in ["WR", "TE"]):
+            # Strictly RB and WR only (No TEs in FLEX per league rules)
+            if "FLEX" in slot and any(p in player["positions"] for p in ["RB", "WR"]):
                 eligible = True
                 
             if eligible:
@@ -1343,7 +1355,74 @@ with tab5:
     )
     fig_core.update_traces(textposition="top center")
     st.plotly_chart(fig_core, use_container_width=True)
+# =====================================================================
+    # 5. THE 15-KEEPER DYNASTY LIFE-CYCLE & AGE RADAR (FEATURE 4)
+    # =====================================================================
+    st.markdown("---")
+    st.subheader("⏳ Dynasty Asset Depreciation & Age Radar")
+    st.caption("Identify 'Sell-High Windows' on aging veterans before their keeper value drops off a cliff.")
 
+    # Calculate Dynasty Age Tiers
+    age_audit_rows = []
+    for pid in team_player_ids:
+        p_info = player_db.get(pid, {})
+        full_name = p_info.get("full_name") or f"Player {pid}"
+        pos = p_info.get("position", "N/A")
+        age = p_info.get("age", 25)
+        pts = player_season_pts.get(pid, 0.0)
+
+        # Dynasty Age Cliff Logic
+        if pos == "RB":
+            if age >= 29:
+                window = "🚨 Sell-High Window (Cliff Approaching)"
+            elif age <= 24:
+                window = "💎 Ascending Youth (Core Asset)"
+            else:
+                window = "🟢 Prime Window"
+        elif pos in ("WR", "TE"):
+            if age >= 31:
+                window = "🚨 Sell-High Window (Cliff Approaching)"
+            elif age <= 24:
+                window = "💎 Ascending Youth (Core Asset)"
+            else:
+                window = "🟢 Prime Window"
+        elif pos == "QB":
+            if age >= 35:
+                window = "🚨 Sell-High Window (Cliff Approaching)"
+            elif age <= 25:
+                window = "💎 Ascending Youth (Core Asset)"
+            else:
+                window = "🟢 Prime Window"
+        else:
+            window = "Standard"
+
+        age_audit_rows.append({
+            "Player": full_name,
+            "Pos": pos,
+            "Age": age,
+            "Season Pts": round(pts, 1),
+            "Dynasty Window": window
+        })
+
+    df_age_radar = pd.DataFrame(age_audit_rows).sort_values(by=["Age", "Season Pts"], ascending=[False, False])
+
+    avg_keeper_age = df_age_radar.head(15)["Age"].mean() if len(df_age_radar) >= 15 else 26.0
+
+    a1, a2 = st.columns([1, 2])
+    with a1:
+        st.metric("Avg Keeper Age (Top 15)", f"{avg_keeper_age:.1f} yrs")
+        if avg_keeper_age >= 28.0:
+            st.warning("⚠️ **Win-Now Window:** Older roster. Maximize your championship push this year before age-related keeper cuts.")
+        else:
+            st.success("🌱 **Young Dynasty Core:** Roster has strong multi-year championship runway.")
+
+    with a2:
+        st.dataframe(
+            df_age_radar[["Player", "Pos", "Age", "Season Pts", "Dynasty Window"]],
+            use_container_width=True,
+            hide_index=True
+        )
+        
 # ----- TAB 6: LUCK VS STRENGTH -----
 with tab6:
     st.subheader("Schedule Luck: True Strength vs Matchup Variance")
@@ -1361,11 +1440,11 @@ with tab6:
     st.plotly_chart(fig_luck, use_container_width=False)
     
 # =====================================================================
-# ----- TAB 7: THE MARSHALL FAULKS WAR ROOM & START/SIT ADVISOR -----
+# ----- TAB 7: THE MARSHALL FAULKS WAR ROOM & MATCHDAY ADVISOR -----
 # =====================================================================
 with tab7:
     st.subheader("🏈 TheMarshallFaulks Personal Matchup War Room")
-    st.caption("Live Vegas lines, stadium weather impact, floor/ceiling volatility, and start/sit decision badges.")
+    st.caption("Live Vegas odds, stadium weather impact, floor/ceiling volatility, and start/sit decision badges.")
 
     # 1. Identify Target Team
     all_team_names = list(roster_names.values())
@@ -1387,7 +1466,7 @@ with tab7:
 
     my_r_id = [k for k, v in roster_names.items() if v == selected_my_team][0]
 
-    # 2. Fetch live Vegas & Weather
+    # 2. Fetch live Vegas & Weather for the selected week
     curr_season = selected_league.get("season", "2026")
     vegas_env = get_nfl_matchup_env(curr_season, selected_matchup_week)
     projections_map = get_weekly_projections(curr_season, selected_matchup_week)
@@ -1400,7 +1479,7 @@ with tab7:
     my_latest_m = next((m for m in latest_matchups if m.get("roster_id") == my_r_id), {})
     current_starters_set = set(my_latest_m.get("starters") or [])
 
-    # ----------------- COMPLETED HISTORICAL GAMES ONLY -----------------
+    # Historical completed points for volatility (Completed weeks only!)
     player_completed_pts = defaultdict(list)
     completed_weeks_count = max(0, selected_matchup_week - 1)
 
@@ -1414,14 +1493,14 @@ with tab7:
                         if pts is not None and pts > 0.0:
                             player_completed_pts[pid].append(pts)
 
-    # ----------------- SLEEPER EXACT LINEUP ORDERING -----------------
+    # Sleeper Exact Lineup Ordering
     starter_slots = [p for p in selected_league.get("roster_positions", []) if p not in ("BN", "IR", "TAXI")]
     my_starters_list = my_latest_m.get("starters") or []
 
     starter_slot_assignments = {}
     ordered_starter_pids = []
-
     slot_counts = defaultdict(int)
+
     for slot_name, pid in zip(starter_slots, my_starters_list):
         if pid and pid != "0":
             slot_counts[slot_name] += 1
@@ -1455,11 +1534,9 @@ with tab7:
         pos = p_info.get("position", "N/A")
         nfl_t = (p_info.get("team") or "").upper()
         
-        # 1. INJURY STATUS
         raw_inj = p_info.get("injury_status")
         inj_display = injury_badge_map.get(raw_inj, "🟢 Healthy")
 
-        # 2. PROJECTION & FLOOR/CEILING
         p_proj_info = projections_map.get(pid, {})
         proj = p_proj_info.get("pts", 0.0) if isinstance(p_proj_info, dict) else (float(p_proj_info) if p_proj_info else 0.0)
         hist = player_completed_pts.get(pid, [])
@@ -1468,6 +1545,7 @@ with tab7:
             import numpy as np
             proj = round(float(np.mean(hist)), 1)
 
+        # Realistic Floor/Ceiling
         if len(hist) >= 4:
             import numpy as np
             mu = float(np.mean(hist))
@@ -1497,15 +1575,15 @@ with tab7:
             floor_val = 0.0
             ceil_val = 0.0
 
-        # 3. MATCHUP ODDS
+        # Match Vegas Odds
         if not nfl_t or nfl_t in ("FA", "NONE"):
-            env = {"Opponent": "Free Agent", "OverUnder": None, "Spread": "-", "SpreadVal": 0.0, "IsFavorite": False, "ImpliedTotal": None, "Indoor": False, "Wind": 0, "Condition": "N/A"}
+            env = {"Opponent": "Free Agent", "Kickoff": "-", "IsLateNight": False, "OverUnder": None, "Spread": "-", "SpreadVal": 0.0, "IsFavorite": False, "ImpliedTotal": None, "Indoor": False, "Wind": 0, "Condition": "N/A"}
         elif nfl_t in vegas_env:
             env = vegas_env[nfl_t]
         elif has_active_games:
-            env = {"Opponent": "💤 BYE", "OverUnder": None, "Spread": "-", "SpreadVal": 0.0, "IsFavorite": False, "ImpliedTotal": None, "Indoor": False, "Wind": 0, "Condition": "Bye Week"}
+            env = {"Opponent": "💤 BYE", "Kickoff": "-", "IsLateNight": False, "OverUnder": None, "Spread": "-", "SpreadVal": 0.0, "IsFavorite": False, "ImpliedTotal": None, "Indoor": False, "Wind": 0, "Condition": "Bye Week"}
         else:
-            env = {"Opponent": "TBD", "OverUnder": None, "Spread": "-", "SpreadVal": 0.0, "IsFavorite": False, "ImpliedTotal": None, "Indoor": False, "Wind": 0, "Condition": "Clear"}
+            env = {"Opponent": "TBD", "Kickoff": "-", "IsLateNight": False, "OverUnder": None, "Spread": "-", "SpreadVal": 0.0, "IsFavorite": False, "ImpliedTotal": None, "Indoor": False, "Wind": 0, "Condition": "Clear"}
 
         itt_val = env.get("ImpliedTotal")
         itt_disp = f"{itt_val:.1f}" if (itt_val is not None and isinstance(itt_val, (int, float))) else "-"
@@ -1547,14 +1625,19 @@ with tab7:
         elif cv <= 0.35 and floor_val >= 8.5:
             badges.append("🛡️ Safe Floor")
 
+        game_time_str = f"{env.get('Opponent', '-')} ({env.get('Kickoff', '')})" if env.get('Kickoff') != "-" else env.get('Opponent', '-')
+
         roster_board_rows.append({
             "Slot": slot_label,
             "Photo": get_player_avatar_url(pid),
             "Player": full_name,
             "Pos": pos,
-            "Injury": inj_display,  # <-- NEW INJURY STATUS COLUMN
+            "Injury": inj_display,
+            "Raw Injury": raw_inj,
             "Role": role_label,
-            "Matchup": f"{env.get('Opponent', '-')}",
+            "Game (CEST)": game_time_str,
+            "Kickoff": env.get("Kickoff", ""),
+            "IsLateNight": env.get("IsLateNight", False),
             "O/U": ou_disp,
             "Team ITT": itt_disp,
             "Weather": weather_disp,
@@ -1578,21 +1661,20 @@ with tab7:
     else:
         df_display_war = df_war_room
 
-    # 4. RENDER TABLE WITH INJURY COLUMN & OUTLIER COLOR DETECTOR
+    # 3. Main Roster Table with Outlier Detector
     st.markdown("### 📋 Full Roster Matchup Environment Board")
     st.caption(
         "🔴 **Red = High / Favorable** (Shootout O/U ≥ 47.5 | Floor ≥ 10.0 | Ceiling ≥ 22.0) &nbsp;|&nbsp; "
         "🔵 **Blue = Low / Unfavorable** (Slog O/U ≤ 41.0 | Floor ≤ 5.0 | Ceiling ≤ 13.0)"
     )
 
-    # Outlier detection styling functions for font colors
     def color_ou_outliers(val):
         try:
             num = float(val)
             if num >= 47.5:
-                return "color: #E53935; font-weight: 800;"  # Red for high-scoring shootouts
+                return "color: #E53935; font-weight: 800;"
             elif num <= 41.0:
-                return "color: #1E88E5; font-weight: 800;"  # Blue for low-scoring slogs
+                return "color: #1E88E5; font-weight: 800;"
         except (ValueError, TypeError):
             pass
         return ""
@@ -1601,9 +1683,9 @@ with tab7:
         try:
             num = float(val)
             if num >= 10.0:
-                return "color: #E53935; font-weight: 800;"  # Red for elite safe floor
+                return "color: #E53935; font-weight: 800;"
             elif 0.0 < num <= 5.0:
-                return "color: #1E88E5; font-weight: 800;"  # Blue for low/dud risk
+                return "color: #1E88E5; font-weight: 800;"
         except (ValueError, TypeError):
             pass
         return ""
@@ -1612,28 +1694,21 @@ with tab7:
         try:
             num = float(val)
             if num >= 22.0:
-                return "color: #E53935; font-weight: 800;"  # Red for explosive ceiling
+                return "color: #E53935; font-weight: 800;"
             elif 0.0 < num <= 13.0:
-                return "color: #1E88E5; font-weight: 800;"  # Blue for capped upside
+                return "color: #1E88E5; font-weight: 800;"
         except (ValueError, TypeError):
             pass
         return ""
 
-    # Apply outlier styling to specific columns
-    table_cols = ["Slot", "Photo", "Player", "Pos", "Injury", "Matchup", "O/U", "Team ITT", "Weather", "Proj", "Floor", "Ceiling", "Badges"]
+    table_cols = ["Slot", "Photo", "Player", "Pos", "Injury", "Game (CEST)", "O/U", "Team ITT", "Weather", "Proj", "Floor", "Ceiling", "Badges"]
     df_to_render = df_display_war[table_cols].copy()
 
     styler_war = df_to_render.style.map if hasattr(df_to_render.style, "map") else df_to_render.style.applymap
     styled_war = styler_war(color_ou_outliers, subset=["O/U"])
     styled_war = styler_war(color_floor_outliers, subset=["Floor"])
     styled_war = styler_war(color_ceiling_outliers, subset=["Ceiling"])
-
-    # Format numbers to strictly 1 decimal place
-    styled_war = styled_war.format({
-        "Proj": "{:.1f}",
-        "Floor": "{:.1f}",
-        "Ceiling": "{:.1f}"
-    })
+    styled_war = styled_war.format({"Proj": "{:.1f}", "Floor": "{:.1f}", "Ceiling": "{:.1f}"})
 
     war_col_config = {
         "Slot": st.column_config.TextColumn("Slot", width=70),
@@ -1641,7 +1716,7 @@ with tab7:
         "Player": st.column_config.TextColumn("Player", width=140),
         "Pos": st.column_config.TextColumn("Pos", width=50),
         "Injury": st.column_config.TextColumn("Injury", width=85),
-        "Matchup": st.column_config.TextColumn("Game", width=90),
+        "Game (CEST)": st.column_config.TextColumn("Game (CEST)", width=135),
         "O/U": st.column_config.TextColumn("O/U", width=65),
         "Team ITT": st.column_config.TextColumn("ITT (Pts)", width=75),
         "Weather": st.column_config.TextColumn("Weather", width=85),
@@ -1651,79 +1726,206 @@ with tab7:
         "Badges": st.column_config.TextColumn("Matchup Badges & Archetype", width=230)
     }
 
-    st.dataframe(
-        styled_war,
-        column_config=war_col_config,
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(styled_war, column_config=war_col_config, use_container_width=True, hide_index=True)
 
+    # 4. Opponent Scouting Dossier
     st.markdown("---")
+    st.subheader("⚔️ Matchup Scouting Dossier: Know Your Enemy")
+    st.caption("Auto-detects your Sleeper head-to-head opponent, compares starting lineups slot-by-slot, and builds a tactical battle plan.")
 
-    # 5. INTERACTIVE 1-ON-1 START/SIT COIN-FLIP SOLVER
-    st.subheader("⚔️ Head-to-Head Start/Sit Coin-Flip Solver")
-    st.caption("Torn between two players? Compare their game environments and volatility side-by-side.")
+    my_matchup_id = my_latest_m.get("matchup_id")
+    opp_m = next((m for m in latest_matchups if m.get("matchup_id") == my_matchup_id and m.get("roster_id") != my_r_id), None)
 
-    player_choices = df_war_room["Player"].tolist()
-    if len(player_choices) >= 2:
-        col_p1, col_p2 = st.columns(2)
-        with col_p1:
-            p1_name = st.selectbox("Player A (Current Starter)", player_choices, index=0, key="flip_p1")
-            p1_data = df_war_room[df_war_room["Player"] == p1_name].iloc[0]
-        with col_p2:
-            p2_name = st.selectbox("Player B (Bench Challenger)", player_choices, index=1, key="flip_p2")
-            p2_data = df_war_room[df_war_room["Player"] == p2_name].iloc[0]
+    if opp_m:
+        opp_r_id = opp_m.get("roster_id")
+        opp_team_name = roster_names.get(opp_r_id, f"Team {opp_r_id}")
+        opp_starters_list = opp_m.get("starters") or []
 
-        card1, card2 = st.columns(2)
+        # Standardize slot names
+        slot_counts = defaultdict(int)
+        ordered_slots = []
+        for s in starter_slots:
+            slot_counts[s] += 1
+            label = f"{s}{slot_counts[s]}" if starter_slots.count(s) > 1 else s
+            ordered_slots.append(label)
 
-        with card1:
-            st.markdown(f"#### {p1_data['Player']} ({p1_data['Pos']}) — {p1_data['Injury']}")
-            st.write(f"**Matchup:** {p1_data['Matchup']} | **Venue:** {p1_data['Weather']}")
-            st.write(f"**Vegas Game Total:** `{p1_data['O/U']} O/U` | **Team Implied Pts:** `{p1_data['Team ITT']}`")
-            st.metric("Projected Points", f"{p1_data['Proj']:.1f}", f"Floor: {p1_data['Floor']:.1f} | Ceiling: {p1_data['Ceiling']:.1f}")
-            st.info(f"**Archetype:** {p1_data['Badges']}")
+        my_starter_ids = my_latest_m.get("starters") or []
+        h2h_rows = []
+        my_chart_names, my_chart_pts = [], []
+        opp_chart_names, opp_chart_pts = [], []
+        opp_proj_total = 0.0
 
-        with card2:
-            st.markdown(f"#### {p2_data['Player']} ({p2_data['Pos']}) — {p2_data['Injury']}")
-            st.write(f"**Matchup:** {p2_data['Matchup']} | **Venue:** {p2_data['Weather']}")
-            st.write(f"**Vegas Game Total:** `{p2_data['O/U']} O/U` | **Team Implied Pts:** `{p2_data['Team ITT']}`")
-            st.metric("Projected Points", f"{p2_data['Proj']:.1f}", f"Floor: {p2_data['Floor']:.1f} | Ceiling: {p2_data['Ceiling']:.1f}")
-            st.info(f"**Archetype:** {p2_data['Badges']}")
+        for i, slot_name in enumerate(ordered_slots):
+            # Your team
+            my_pid = my_starter_ids[i] if i < len(my_starter_ids) else None
+            my_info = player_db.get(my_pid, {}) if my_pid else {}
+            my_name = my_info.get("full_name") or f"Player {my_pid}" if my_pid and my_pid != "0" else "Empty"
+            my_inj = injury_badge_map.get(my_info.get("injury_status"), "🟢 Healthy")
+            
+            p_my_proj = projections_map.get(my_pid, {})
+            my_p = p_my_proj.get("pts", 0.0) if isinstance(p_my_proj, dict) else (float(p_my_proj) if p_my_proj else 0.0)
+            hist_my = player_completed_pts.get(my_pid, [])
+            if my_p == 0.0 and hist_my:
+                import numpy as np
+                my_p = round(float(np.mean(hist_my)), 1)
+            if my_name == "Empty":
+                my_p = 0.0
 
-        st.markdown("##### 💡 Strategic Recommendation")
-        try:
-            itt1 = float(p1_data["Team ITT"]) if p1_data["Team ITT"] != "-" else 20.0
-            itt2 = float(p2_data["Team ITT"]) if p2_data["Team ITT"] != "-" else 20.0
-        except ValueError:
-            itt1, itt2 = 20.0, 20.0
+            # Opponent team
+            opp_pid = opp_starters_list[i] if i < len(opp_starters_list) else None
+            opp_info = player_db.get(opp_pid, {}) if opp_pid else {}
+            opp_name = opp_info.get("full_name") or f"Player {opp_pid}" if opp_pid and opp_pid != "0" else "Empty"
+            opp_inj = injury_badge_map.get(opp_info.get("injury_status"), "🟢 Healthy")
+            
+            p_opp_proj = projections_map.get(opp_pid, {})
+            opp_p = p_opp_proj.get("pts", 0.0) if isinstance(p_opp_proj, dict) else (float(p_opp_proj) if p_opp_proj else 0.0)
+            if opp_name == "Empty":
+                opp_p = 0.0
 
-        if p1_data["Ceiling"] > p2_data["Ceiling"] and p1_data["Floor"] < p2_data["Floor"]:
-            st.warning(
-                f"**The Decision Blueprint:** Start **{p2_data['Player']}** if you are favored and need a **🛡️ Safe Floor** ({p2_data['Floor']:.1f} pts minimum). "
-                f"Start **{p1_data['Player']}** if you are the underdog and need an explosive **🧨 High Ceiling** ({p1_data['Ceiling']:.1f} pts potential)."
-            )
-        elif p1_data["Proj"] >= p2_data["Proj"] and itt1 >= itt2:
-            st.success(f"**Consensus Pick:** Start **{p1_data['Player']}**. Superior projected baseline and playing in a higher-scoring offensive environment ({p1_data['Team ITT']} implied points).")
+            opp_proj_total += opp_p
+            diff = round(my_p - opp_p, 1)
+            adv_str = f"+{diff:.1f} (You)" if diff > 0 else (f"{diff:.1f} ({opp_team_name})" if diff < 0 else "Even")
+
+            h2h_rows.append({
+                "Slot": slot_name,
+                "Your Player": f"{my_name} ({my_inj})",
+                "Your Proj": my_p,
+                "Opponent Player": f"{opp_name} ({opp_inj})",
+                "Opp Proj": opp_p,
+                "Net Advantage": adv_str,
+                "Raw Diff": diff
+            })
+
+            my_chart_names.append(my_name)
+            my_chart_pts.append(my_p)
+            opp_chart_names.append(opp_name)
+            opp_chart_pts.append(opp_p)
+
+        my_starters_df = df_war_room[df_war_room["Role"] == "⭐ Starter"]
+        my_proj_total = round(float(my_starters_df["Proj"].sum()), 1)
+        spread_diff = round(my_proj_total - opp_proj_total, 1)
+
+        c_my, c_vs, c_opp = st.columns([2, 1, 2])
+        c_my.metric(f"Your Lineup ({selected_my_team})", f"{my_proj_total:.1f} pts", delta=f"{spread_diff:+.1f} pts favored" if spread_diff >= 0 else f"{spread_diff:.1f} pts underdog")
+        c_vs.markdown("<h2 style='text-align: center; margin-top: 15px;'>VS</h2>", unsafe_allow_html=True)
+        c_opp.metric(f"Opponent ({opp_team_name})", f"{opp_proj_total:.1f} pts")
+
+        if spread_diff >= 8.0:
+            st.success(f"🛡️ **Tactical Blueprint: PROTECT THE LEAD.** You are favored by **{spread_diff:.1f} points**. Avoid high-variance boom/bust traps. Lock in high-floor volume starters to secure the win.")
+        elif spread_diff <= -8.0:
+            st.warning(f"🧨 **Tactical Blueprint: CEILING CHASE.** You are an underdog by **{abs(spread_diff):.1f} points**. A safe floor won't win this week. Start explosive 🧨 **Boom/Bust** players with high ceiling potential.")
         else:
-            st.info(f"**Even Coin-Flip:** **{p1_data['Player']}** ({p1_data['Proj']:.1f} proj) and **{p2_data['Player']}** ({p2_data['Proj']:.1f} proj) have similar median expectations. Break the tie by choosing the higher Vegas O/U.")
+            st.info(f"⚖️ **Tactical Blueprint: TIGHT CONTEST.** Projected as a coin-flip matchup (within {abs(spread_diff):.1f} pts). Target players in high Vegas Over/Under shootouts.")
 
-    # =====================================================================
-    # 6. INJURY-AWARE LINEUP OPTIMIZER & PROTOCOL
-    # =====================================================================
+        # Bi-Directional Mirror Bar Chart
+        fig_mirror = go.Figure()
+        fig_mirror.add_trace(go.Bar(
+            y=ordered_slots,
+            x=[-val for val in my_chart_pts],
+            orientation='h',
+            name=selected_my_team,
+            text=[f"<b>{val:.1f}</b> ({name})" for name, val in zip(my_chart_names, my_chart_pts)],
+            textposition='auto',
+            marker=dict(color='#1f77b4'),
+            hovertemplate="<b>%{y}</b>: %{customdata} (%{text})<extra></extra>",
+            customdata=my_chart_names
+        ))
+        fig_mirror.add_trace(go.Bar(
+            y=ordered_slots,
+            x=opp_chart_pts,
+            orientation='h',
+            name=opp_team_name,
+            text=[f"({name}) <b>{val:.1f}</b>" for name, val in zip(opp_chart_names, opp_chart_pts)],
+            textposition='auto',
+            marker=dict(color='#ff7f0e'),
+            hovertemplate="<b>%{y}</b>: %{customdata} (%{text})<extra></extra>",
+            customdata=opp_chart_names
+        ))
+
+        max_val = max(max(my_chart_pts, default=20), max(opp_chart_pts, default=20))
+        axis_limit = int(max_val + 5)
+        tick_vals = [-25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25]
+        tick_labels = [str(abs(t)) for t in tick_vals]
+
+        fig_mirror.update_layout(
+            barmode='overlay',
+            yaxis=dict(autorange="reversed", title=""),
+            xaxis=dict(range=[-axis_limit, axis_limit], tickvals=tick_vals, ticktext=tick_labels, title="Projected Points (Left: You | Right: Opponent)"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="center", x=0.5),
+            height=460,
+            margin=dict(l=60, r=60, t=40, b=40)
+        )
+        fig_mirror.add_vline(x=0, line_width=2, line_color="rgba(150, 150, 150, 0.5)")
+        st.plotly_chart(fig_mirror, use_container_width=True)
+
+        with st.expander("📋 View Exact Slot Advantage Data Table"):
+            df_h2h = pd.DataFrame(h2h_rows)
+
+            def style_h2h_diff(val):
+                if isinstance(val, (int, float)):
+                    if val > 0:
+                        return "color: #2ca02c; font-weight: 800;"  # Green for your advantage
+                    elif val < 0:
+                        return "color: #d62728; font-weight: 800;"  # Red for opponent advantage
+                return ""
+
+            styler_h2h = df_h2h.style.map if hasattr(df_h2h.style, "map") else df_h2h.style.applymap
+            styled_h2h = styler_h2h(style_h2h_diff, subset=["Raw Diff"])
+            
+            # Formats Raw Diff to 1 decimal place with explicit +/- signs
+            styled_h2h = styled_h2h.format({
+                "Your Proj": "{:.1f}", 
+                "Opp Proj": "{:.1f}",
+                "Raw Diff": "{:+.1f}"  # <-- Locks to 1 decimal (+4.1, -2.2)
+            })
+
+            h2h_col_config = {
+                "Slot": st.column_config.TextColumn("Slot", width=65),
+                "Your Player": st.column_config.TextColumn("Your Starter", width=180),
+                "Your Proj": st.column_config.NumberColumn("Proj", format="%.1f", width=65),
+                "Opponent Player": st.column_config.TextColumn(f"{opp_team_name} Starter", width=180),
+                "Opp Proj": st.column_config.NumberColumn("Proj", format="%.1f", width=65),
+                "Net Advantage": st.column_config.TextColumn("Advantage", width=130),
+                "Raw Diff": st.column_config.NumberColumn("Margin (Pts)", format="%.1f", width=85)
+            }
+
+            st.dataframe(
+                styled_h2h, 
+                column_config=h2h_col_config,
+                use_container_width=True, 
+                hide_index=True
+            )
+    else:
+        st.write("Matchup schedule in progress.")
+
+    # 5. European Midnight Risk Protocol
     st.markdown("---")
-    st.subheader("🔮 Weekly Lineup Optimizer & Injury Protocol")
-    st.caption("Solves your optimal starting lineup while accounting for game-time injury designations.")
+    st.subheader("🔮 Lineup Optimizer & European Midnight Safety Protocol")
 
-    # Interactive Injury Risk Toggle
+    my_starters_df = df_war_room[df_war_room["Role"] == "⭐ Starter"]
+    night_injury_risks = my_starters_df[
+        (my_starters_df["IsLateNight"]) & 
+        (my_starters_df["Raw Injury"].isin(["Questionable", "Doubtful"]))
+    ]
+
+    if not night_injury_risks.empty:
+        for _, risk_row in night_injury_risks.iterrows():
+            st.error(
+                f"🚨 **EUROPEAN MIDNIGHT RISK (Spain CEST):**\n\n"
+                f"**{risk_row['Player']}** ({risk_row['Slot']}) kicks off at **{risk_row['Kickoff']}** (after midnight) "
+                f"and is listed as **{str(risk_row['Raw Injury']).upper()}**!\n\n"
+                f"* **The Problem:** Inactives drop at 00:45 CEST while you are asleep. If he is ruled OUT, you will wake up with a 0!\n"
+                f"* **Action Plan:** Unless you have an emergency backup playing in that same late game, **sub him out before the 19:00 CEST early kickoff!**"
+            )
+    else:
+        st.success("✅ **European Schedule Clear:** None of your starters carry late-night (02:15 CEST) injury uncertainty. All your Questionable players play in the early/afternoon windows (19:00 or 22:05 CEST).")
+
+    # Toggle for Questionable starters
     c_opt_title, c_toggle = st.columns([3, 2])
     with c_toggle:
-        risk_mode = st.toggle(
-            "Assume Questionable (Q) players will play", 
-            value=True, 
-            help="Toggle OFF to force the optimizer to bench all Questionable/Doubtful players and optimize ONLY with 100% healthy starters."
-        )
+        risk_mode = st.toggle("Assume Questionable (Q) players will play", value=True)
 
-    # Build optimization pool with injury filters
+    # Optimization Pool
     roster_proj_pool = []
     for pid in my_player_ids:
         p_info = player_db.get(pid, {})
@@ -1734,17 +1936,9 @@ with tab7:
         
         p_proj_info = projections_map.get(pid, {})
         p_pts = p_proj_info.get("pts", 0.0) if isinstance(p_proj_info, dict) else (float(p_proj_info) if p_proj_info else 0.0)
-        
-        hist = player_completed_pts.get(pid, [])
-        if p_pts == 0.0 and hist:
-            import numpy as np
-            p_pts = round(float(np.mean(hist)), 1)
 
-        # INJURY LOGIC:
-        # Out / IR / PUP can NEVER start
         if raw_inj in ("Out", "IR", "PUP", "Sus"):
             effective_pts = 0.0
-        # If conservative mode is active, bench Questionable / Doubtful players
         elif raw_inj in ("Questionable", "Doubtful") and not risk_mode:
             effective_pts = 0.0
         else:
@@ -1757,8 +1951,7 @@ with tab7:
             "raw_inj": raw_inj,
             "inj_display": injury_badge_map.get(raw_inj, "🟢 Healthy"),
             "positions": fantasy_pos,
-            "pts": effective_pts,
-            "raw_pts": p_pts
+            "pts": effective_pts
         })
 
     roster_proj_pool.sort(key=lambda x: x["pts"], reverse=True)
@@ -1777,18 +1970,13 @@ with tab7:
                 optimal_starters_dict[p["id"]] = {"player": p, "slot": slot}
                 break
 
+    # STRICT RULE: FLEX is RB/WR only (NO TE)
     for slot in flex_slots:
         for p in roster_proj_pool:
             if p["id"] in used_opt_ids:
                 continue
             eligible = False
-            if slot == "FLEX" and any(pos_tag in p["positions"] for pos_tag in ["RB", "WR", "TE"]):
-                eligible = True
-            elif slot == "SUPER_FLEX" and any(pos_tag in p["positions"] for pos_tag in ["QB", "RB", "WR", "TE"]):
-                eligible = True
-            elif slot == "WRRB_FLEX" and any(pos_tag in p["positions"] for pos_tag in ["RB", "WR"]):
-                eligible = True
-            elif slot == "REC_FLEX" and any(pos_tag in p["positions"] for pos_tag in ["WR", "TE"]):
+            if "FLEX" in slot and any(pos_tag in p["positions"] for pos_tag in ["RB", "WR"]):
                 eligible = True
 
             if eligible:
@@ -1810,24 +1998,21 @@ with tab7:
         status_note = "Safe Mode Active" if not risk_mode else "100% Optimal"
         c_gain.metric("Lineup Efficiency", status_note, delta="Perfect Lineup", delta_color="normal")
 
-    # 4. GENERATE SPECIFIC START/SIT SWAP ALERTS (POSITION-LEGAL 2-PASS MATCHER)
     bench_should_start = [item["player"] for pid, item in optimal_starters_dict.items() if pid not in current_starters_set]
     starters_should_bench = [p for p in roster_proj_pool if p["id"] in current_starters_set and p["id"] not in used_opt_ids]
 
     if bench_should_start and starters_should_bench:
         st.markdown("#### 🚨 Recommended Lineup Adjustments")
-        
         entering = list(bench_should_start)
         exiting = list(starters_should_bench)
 
-        # Sort entering by highest points, exiting by lowest points (replace worst starters first)
         entering.sort(key=lambda x: x["pts"], reverse=True)
         exiting.sort(key=lambda x: x["pts"])
 
         resolved_swaps = []
         remaining_entering = []
 
-        # PASS 1: Strict same-position swaps (RB for RB, WR for WR, TE for TE, QB for QB)
+        # Pass 1: Strict position match
         for b_p in entering:
             matched_exit = None
             for s_p in exiting:
@@ -1840,39 +2025,30 @@ with tab7:
             else:
                 remaining_entering.append(b_p)
 
-        # PASS 2: FLEX slot swaps (only allow RB/WR/TE cross-swaps if FLEX is available)
+        # Pass 2: FLEX (RB/WR only!)
         has_flex_slot = any("FLEX" in s for s in opt_starting_slots)
         for b_p in remaining_entering:
             matched_exit = None
-            if has_flex_slot and b_p["pos"] in ("RB", "WR", "TE"):
+            if has_flex_slot and b_p["pos"] in ("RB", "WR"):
                 for s_p in exiting:
-                    if s_p["pos"] in ("RB", "WR", "TE"):
+                    if s_p["pos"] in ("RB", "WR"):
                         matched_exit = s_p
                         break
             if matched_exit:
                 exiting.remove(matched_exit)
-                resolved_swaps.append((b_p, matched_exit, "FLEX Slot"))
-            elif exiting:
-                matched_exit = exiting.pop(0)
-                resolved_swaps.append((b_p, matched_exit, "Lineup Slot"))
+                resolved_swaps.append((b_p, matched_exit, "FLEX Slot (RB/WR)"))
 
-        # Render clean, positive, legal swap cards
         for b_player, matched_starter, slot_desc in resolved_swaps:
             diff = b_player["pts"] - matched_starter["pts"]
-            
-            # Guard against negative recommendations
             if diff <= 0.0:
                 continue
 
-            # Injury protocol warning if questionable
             if b_player.get("raw_inj") in ("Questionable", "Doubtful"):
                 st.warning(
                     f"🔄 **SUB IN (HIGH UPSIDE): {b_player['name']} ({b_player['pos']}) [ {b_player['inj_display']} ]** "
                     f"for **{matched_starter['name']} ({matched_starter['pos']})** in `{slot_desc}`\n\n"
                     f"* **Projected Gain:** `+{diff:.1f} pts` ({b_player['pts']:.1f} vs. {matched_starter['pts']:.1f})\n"
-                    f"* **🩺 Game-Time Protocol:** {b_player['name']} is currently **{b_player['raw_inj'].upper()}**. "
-                    f"If announced **ACTIVE** 90 mins before kickoff, start him for the ceiling advantage. "
-                    f"If ruled out, keep **{matched_starter['name']}** locked in."
+                    f"* **🩺 Game-Time Protocol:** Check inactives before kickoff. If announced ACTIVE, start him for the ceiling advantage. If ruled out, keep **{matched_starter['name']}** locked in."
                 )
             else:
                 st.success(
