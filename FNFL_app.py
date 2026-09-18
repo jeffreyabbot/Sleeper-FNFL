@@ -1810,39 +1810,74 @@ with tab7:
         status_note = "Safe Mode Active" if not risk_mode else "100% Optimal"
         c_gain.metric("Lineup Efficiency", status_note, delta="Perfect Lineup", delta_color="normal")
 
+    # 4. GENERATE SPECIFIC START/SIT SWAP ALERTS (POSITION-LEGAL 2-PASS MATCHER)
     bench_should_start = [item["player"] for pid, item in optimal_starters_dict.items() if pid not in current_starters_set]
     starters_should_bench = [p for p in roster_proj_pool if p["id"] in current_starters_set and p["id"] not in used_opt_ids]
 
     if bench_should_start and starters_should_bench:
         st.markdown("#### 🚨 Recommended Lineup Adjustments")
-        starters_to_replace = list(starters_should_bench)
+        
+        entering = list(bench_should_start)
+        exiting = list(starters_should_bench)
 
-        for b_player in bench_should_start:
-            matched_starter = None
-            for s_player in starters_to_replace:
-                if s_player["pos"] == b_player["pos"] or (b_player["pos"] in ("RB", "WR", "TE") and s_player["pos"] in ("RB", "WR", "TE")):
-                    matched_starter = s_player
+        # Sort entering by highest points, exiting by lowest points (replace worst starters first)
+        entering.sort(key=lambda x: x["pts"], reverse=True)
+        exiting.sort(key=lambda x: x["pts"])
+
+        resolved_swaps = []
+        remaining_entering = []
+
+        # PASS 1: Strict same-position swaps (RB for RB, WR for WR, TE for TE, QB for QB)
+        for b_p in entering:
+            matched_exit = None
+            for s_p in exiting:
+                if s_p["pos"] == b_p["pos"]:
+                    matched_exit = s_p
                     break
-            if not matched_starter and starters_to_replace:
-                matched_starter = starters_to_replace[0]
+            if matched_exit:
+                exiting.remove(matched_exit)
+                resolved_swaps.append((b_p, matched_exit, f"{b_p['pos']} Slot"))
+            else:
+                remaining_entering.append(b_p)
 
-            if matched_starter:
-                starters_to_replace.remove(matched_starter)
-                diff = b_player["pts"] - matched_starter["pts"]
-                
-                # Dynamic injury advisory text
-                if b_player["raw_inj"] in ("Questionable", "Doubtful"):
-                    st.warning(
-                        f"🔄 **SUB IN (HIGH UPSIDE): {b_player['name']} ({b_player['pos']}) [ {b_player['inj_display']} ]** for **{matched_starter['name']} ({matched_starter['pos']})**\n\n"
-                        f"* **Projected Gain:** `+{diff:.1f} pts` ({b_player['pts']:.1f} vs. {matched_starter['pts']:.1f})\n"
-                        f"* **🩺 Game-Time Protocol:** {b_player['name']} is listed as **{b_player['raw_inj'].upper()}**. "
-                        f"If announced **ACTIVE** 90 minutes before kickoff, start him for the ceiling advantage. "
-                        f"If announced inactive, keep **{matched_starter['name']}** locked in."
-                    )
-                else:
-                    st.success(
-                        f"🔄 **SUB IN (HEALTHY UPGRADE): {b_player['name']} ({b_player['pos']})** for **{matched_starter['name']} ({matched_starter['pos']})**\n\n"
-                        f"* **Projected Gain:** `+{diff:.1f} pts` ({b_player['pts']:.1f} vs. {matched_starter['pts']:.1f})"
-                    )
+        # PASS 2: FLEX slot swaps (only allow RB/WR/TE cross-swaps if FLEX is available)
+        has_flex_slot = any("FLEX" in s for s in opt_starting_slots)
+        for b_p in remaining_entering:
+            matched_exit = None
+            if has_flex_slot and b_p["pos"] in ("RB", "WR", "TE"):
+                for s_p in exiting:
+                    if s_p["pos"] in ("RB", "WR", "TE"):
+                        matched_exit = s_p
+                        break
+            if matched_exit:
+                exiting.remove(matched_exit)
+                resolved_swaps.append((b_p, matched_exit, "FLEX Slot"))
+            elif exiting:
+                matched_exit = exiting.pop(0)
+                resolved_swaps.append((b_p, matched_exit, "Lineup Slot"))
+
+        # Render clean, positive, legal swap cards
+        for b_player, matched_starter, slot_desc in resolved_swaps:
+            diff = b_player["pts"] - matched_starter["pts"]
+            
+            # Guard against negative recommendations
+            if diff <= 0.0:
+                continue
+
+            # Injury protocol warning if questionable
+            if b_player.get("raw_inj") in ("Questionable", "Doubtful"):
+                st.warning(
+                    f"🔄 **SUB IN (HIGH UPSIDE): {b_player['name']} ({b_player['pos']}) [ {b_player['inj_display']} ]** "
+                    f"for **{matched_starter['name']} ({matched_starter['pos']})** in `{slot_desc}`\n\n"
+                    f"* **Projected Gain:** `+{diff:.1f} pts` ({b_player['pts']:.1f} vs. {matched_starter['pts']:.1f})\n"
+                    f"* **🩺 Game-Time Protocol:** {b_player['name']} is currently **{b_player['raw_inj'].upper()}**. "
+                    f"If announced **ACTIVE** 90 mins before kickoff, start him for the ceiling advantage. "
+                    f"If ruled out, keep **{matched_starter['name']}** locked in."
+                )
+            else:
+                st.success(
+                    f"🔄 **SUB IN: {b_player['name']} ({b_player['pos']})** for **{matched_starter['name']} ({matched_starter['pos']})** in `{slot_desc}`\n\n"
+                    f"* **Projected Gain:** `+{diff:.1f} pts` ({b_player['pts']:.1f} vs. {matched_starter['pts']:.1f})"
+                )
     else:
         st.success("✅ **Lineup Perfection:** Your active starting lineup is currently mathematically optimal based on weekly projections. No adjustments recommended!")
